@@ -1,9 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Camera, Upload, Send, Activity, Heart, Thermometer, Wind, Droplet, User, ClipboardList, Loader2, CheckCircle2, AlertCircle, Sparkles, Scale, Ruler, LogOut, Search, LayoutGrid, List as ListIcon, X } from 'lucide-react';
+import { Camera, Upload, Send, Activity, Heart, Thermometer, Wind, Droplet, User, ClipboardList, Loader2, CheckCircle2, AlertCircle, Sparkles, Scale, Ruler, LogOut, Search, LayoutGrid, List as ListIcon, X, Clock, ArrowUpToLine, Ban, ScanBarcode } from 'lucide-react';
 import Tesseract from 'tesseract.js';
 import { BmsSessionProvider, useBmsSessionContext } from './src/contexts/BmsSessionContext';
 import SessionValidator from './src/components/SessionValidator';
+import CentralDbSettings from './src/components/CentralDbSettings';
+import BarcodeScanner from './src/components/BarcodeScanner';
 import { saveOpdscreen, listTodaysOpdscreen } from './src/services/opdscreen';
+import {
+  isCentralEnabled,
+  submitVitalToCentral,
+  listPendingFromCentral,
+  commitOnCentral,
+  rejectOnCentral,
+} from './src/services/centralDb';
 
 // Hash-based routing — no router library. Patient and nurse pages are gated by
 // URL only (per requirement); anyone with a session can hit either by typing
@@ -12,6 +21,7 @@ function parseHashRoute() {
   if (typeof window === 'undefined') return 'patient';
   const h = window.location.hash.replace(/^#\/?/, '');
   if (h.startsWith('nurse')) return 'nurse';
+  if (h.startsWith('settings')) return 'settings';
   return 'patient';
 }
 
@@ -47,10 +57,14 @@ function VitalSignsAppInner() {
   const [measuredAt, setMeasuredAt] = useState(null); // "YYYY-MM-DD HH:mm"
   const [measuredAtSource, setMeasuredAtSource] = useState(null); // 'slip' | 'now' | null
   const [records, setRecords] = useState([]);
+  const [pendingRecords, setPendingRecords] = useState([]); // จากฐานกลาง
+  const [actingOnId, setActingOnId] = useState(null);       // กำลัง commit/reject อันไหน
+  const [scannerOpen, setScannerOpen] = useState(false);
   const [loadingRecords, setLoadingRecords] = useState(false);
   const [nurseSearch, setNurseSearch] = useState('');
   const [nurseDepFilter, setNurseDepFilter] = useState(''); // depcode or ''
   const [nurseViewMode, setNurseViewMode] = useState('card'); // 'card' | 'list'
+  const centralEnabled = isCentralEnabled();
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
 
@@ -64,13 +78,17 @@ function VitalSignsAppInner() {
   const loadRecords = async () => {
     setLoadingRecords(true);
     try {
-      const result = await listTodaysOpdscreen(session);
-      if (!result.ok) {
-        console.error('Load opdscreen failed:', result.message);
+      // Run HOSxP + central in parallel (central optional).
+      const [opdResult, centralResult] = await Promise.all([
+        listTodaysOpdscreen(session),
+        centralEnabled ? listPendingFromCentral() : Promise.resolve({ ok: true, rows: [] }),
+      ]);
+
+      if (!opdResult.ok) {
+        console.error('Load opdscreen failed:', opdResult.message);
         setRecords([]);
       } else {
-        // map opdscreen rows → existing record shape used by the UI
-        const mapped = result.rows.map((r) => ({
+        const mapped = opdResult.rows.map((r) => ({
           id: `vn_${r.vn}`,
           vn: r.vn,
           patientId: r.hn,
@@ -91,6 +109,34 @@ function VitalSignsAppInner() {
           measuredAt: null,
         }));
         setRecords(mapped);
+      }
+
+      if (!centralResult.ok) {
+        console.error('Load central pending failed:', centralResult.message);
+        setPendingRecords([]);
+      } else {
+        const mappedPending = (centralResult.rows || []).map((r) => ({
+          id: `central_${r.id}`,
+          centralId: r.id,
+          patientId: r.hn,
+          patientName: r.patient_name || '',
+          mainDep: (r.dep_code || '').trim(),
+          depName: r.dep_name || '',
+          vitals: {
+            bpSystolic: r.bps ?? '',
+            bpDiastolic: r.bpd ?? '',
+            hr: r.pulse ?? '',
+            temp: r.temperature ?? '',
+            rr: r.rr ?? '',
+            spo2: r.spo2 ?? '',
+            weight: r.bw ?? '',
+            height: r.height ?? '',
+          },
+          measuredAt: r.measured_at || null,
+          createdAt: r.created_at,
+          createdBy: r.created_by || '',
+        }));
+        setPendingRecords(mappedPending);
       }
     } catch (error) {
       console.error('Load records error:', error);
@@ -215,13 +261,32 @@ function VitalSignsAppInner() {
     }
 
     try {
-      const result = await saveOpdscreen(patientId.trim(), vitals, session);
-      if (!result.ok) {
-        setSubmitStatus({ type: 'error', message: 'บันทึกไม่สำเร็จ: ' + (result.message || 'unknown') });
-        return;
+      let result;
+      let successMessage;
+      if (isCentralEnabled()) {
+        // Staging path: nurse will commit to HOSxP later.
+        result = await submitVitalToCentral({
+          hn: patientId.trim(),
+          vitals,
+          measuredAt,
+          session,
+        });
+        if (!result.ok) {
+          setSubmitStatus({ type: 'error', message: 'ส่งฐานกลางไม่สำเร็จ: ' + (result.message || 'unknown') });
+          return;
+        }
+        successMessage = `ส่งฐานกลางสำเร็จ (ID: ${result.id}) — รอพยาบาลตรวจสอบและส่งเข้า HOSxP`;
+      } else {
+        // Direct path: write straight to opdscreen.
+        result = await saveOpdscreen(patientId.trim(), vitals, session);
+        if (!result.ok) {
+          setSubmitStatus({ type: 'error', message: 'บันทึกไม่สำเร็จ: ' + (result.message || 'unknown') });
+          return;
+        }
+        const verb = result.mode === 'insert' ? 'สร้างใหม่' : 'อัปเดต';
+        successMessage = `บันทึกลง opdscreen สำเร็จ (VN: ${result.vn}, ${verb})`;
       }
-      const verb = result.mode === 'insert' ? 'สร้างใหม่' : 'อัปเดต';
-      setSubmitStatus({ type: 'success', message: `บันทึกลง opdscreen สำเร็จ (VN: ${result.vn}, ${verb})` });
+      setSubmitStatus({ type: 'success', message: successMessage });
       setTimeout(() => {
         setPatientId('');
         setImagePreview(null);
@@ -259,6 +324,57 @@ function VitalSignsAppInner() {
     });
   }, [records, nurseSearch, nurseDepFilter]);
 
+  // Same filter applied to pending records from central.
+  const filteredPending = useMemo(() => {
+    const q = nurseSearch.trim().toLowerCase();
+    return pendingRecords.filter((r) => {
+      if (nurseDepFilter && r.mainDep !== nurseDepFilter) return false;
+      if (q) {
+        const hay = `${r.patientId || ''} ${r.patientName || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [pendingRecords, nurseSearch, nurseDepFilter]);
+
+  // Commit a pending record into HOSxP opdscreen, then mark it committed
+  // on the central server. HOSxP write goes FIRST — if it fails we never
+  // touch central, so the record stays pending and can be retried safely.
+  const handleCommitPending = async (record) => {
+    setActingOnId(record.centralId);
+    try {
+      const opd = await saveOpdscreen(record.patientId, record.vitals, session);
+      if (!opd.ok) {
+        alert('บันทึกเข้า HOSxP ไม่สำเร็จ: ' + (opd.message || 'unknown'));
+        return;
+      }
+      const c = await commitOnCentral(record.centralId, opd.vn);
+      if (!c.ok) {
+        alert(`บันทึกเข้า HOSxP สำเร็จ (VN: ${opd.vn}) แต่ update ฐานกลางไม่ได้: ${c.message}. ลองรีเฟรช`);
+      }
+      await loadRecords();
+    } catch (err) {
+      alert('Commit ผิดพลาด: ' + (err?.message || 'unknown'));
+    } finally {
+      setActingOnId(null);
+    }
+  };
+
+  const handleRejectPending = async (record) => {
+    if (!confirm(`ปฏิเสธรายการของ HN ${record.patientId}?`)) return;
+    setActingOnId(record.centralId);
+    try {
+      const c = await rejectOnCentral(record.centralId);
+      if (!c.ok) {
+        alert('Reject ไม่สำเร็จ: ' + c.message);
+        return;
+      }
+      await loadRecords();
+    } finally {
+      setActingOnId(null);
+    }
+  };
+
   // ฟังก์ชันประเมินค่าผิดปกติ
   const getVitalStatus = (vitals) => {
     const issues = [];
@@ -270,6 +386,11 @@ function VitalSignsAppInner() {
     if (vitals.spo2 && vitals.spo2 < 95) issues.push('SpO₂');
     return [...new Set(issues)];
   };
+
+  // หน้าตั้งค่าฐานกลาง
+  if (view === 'settings') {
+    return <CentralDbSettings />;
+  }
 
   // หน้าพยาบาล
   if (view === 'nurse') {
@@ -361,22 +482,130 @@ function VitalSignsAppInner() {
           </div>
 
           <p className="text-slate-600 text-sm px-1">
-            แสดง <span className="font-bold text-teal-700">{filteredRecords.length}</span>
-            {filteredRecords.length !== records.length && <span className="text-slate-500"> / {records.length}</span>} รายการ
+            {centralEnabled ? (
+              <>
+                รอตรวจ <span className="font-bold text-amber-600">{filteredPending.length}</span>
+                <span className="text-slate-400"> · </span>
+                บันทึกแล้ว <span className="font-bold text-teal-700">{filteredRecords.length}</span>
+                {filteredRecords.length !== records.length && <span className="text-slate-500"> / {records.length}</span>} รายการ
+              </>
+            ) : (
+              <>
+                แสดง <span className="font-bold text-teal-700">{filteredRecords.length}</span>
+                {filteredRecords.length !== records.length && <span className="text-slate-500"> / {records.length}</span>} รายการ
+              </>
+            )}
           </p>
 
-          {loadingRecords ? (
+          {loadingRecords && (
             <div className="flex items-center justify-center py-20">
               <Loader2 className="w-8 h-8 animate-spin text-teal-600" />
             </div>
-          ) : filteredRecords.length === 0 ? (
-            <div className="text-center py-20 bg-white rounded-xl shadow-sm">
-              <ClipboardList className="w-16 h-16 mx-auto text-slate-300 mb-4" />
-              <p className="text-slate-500 text-lg">
-                {records.length === 0 ? 'ยังไม่มีข้อมูลที่บันทึก' : 'ไม่พบรายการที่ตรงกับตัวกรอง'}
+          )}
+
+          {/* ── Section A: pending จากฐานกลาง (เฉพาะตอนเปิดใช้งาน) ── */}
+          {!loadingRecords && centralEnabled && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 pt-2">
+                <Clock className="w-5 h-5 text-amber-500" />
+                <h2 className="text-lg font-bold text-slate-800">
+                  รอตรวจ (ฐานกลาง) — <span className="text-amber-600">{filteredPending.length}</span>
+                </h2>
+              </div>
+              {filteredPending.length === 0 ? (
+                <div className="bg-amber-50/40 border border-amber-100 rounded-xl p-4 text-sm text-amber-700 text-center">
+                  ไม่มีรายการรอตรวจในฐานกลาง
+                </div>
+              ) : (
+                filteredPending.map((record) => {
+                  const issues = getVitalStatus(record.vitals);
+                  const isAbnormal = issues.length > 0;
+                  const acting = actingOnId === record.centralId;
+                  return (
+                    <div
+                      key={record.id}
+                      className={`bg-white rounded-xl shadow-sm border-l-4 ${isAbnormal ? 'border-red-500' : 'border-amber-400'} p-5`}
+                    >
+                      <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${isAbnormal ? 'bg-red-100' : 'bg-amber-100'}`}>
+                            <Clock className={`w-5 h-5 ${isAbnormal ? 'text-red-600' : 'text-amber-600'}`} />
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="font-bold text-slate-800">
+                              HN: {record.patientId}
+                              {record.patientName && (
+                                <span className="font-normal text-slate-600 ml-2">— {record.patientName}</span>
+                              )}
+                            </h3>
+                            <p className="text-xs text-slate-500">
+                              {record.measuredAt && <span>วัดเมื่อ {record.measuredAt}</span>}
+                              {record.createdBy && <span className="ml-2">· โดย {record.createdBy}</span>}
+                              {!record.measuredAt && record.createdAt && <span>ส่งเมื่อ {record.createdAt}</span>}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex gap-2 flex-shrink-0">
+                          <button
+                            onClick={() => handleCommitPending(record)}
+                            disabled={acting}
+                            className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-medium px-3 py-1.5 rounded-lg shadow transition"
+                          >
+                            {acting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArrowUpToLine className="w-3.5 h-3.5" />}
+                            ส่งเข้า HOSxP
+                          </button>
+                          <button
+                            onClick={() => handleRejectPending(record)}
+                            disabled={acting}
+                            className="flex items-center gap-1.5 bg-white border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 text-xs font-medium px-3 py-1.5 rounded-lg transition"
+                          >
+                            <Ban className="w-3.5 h-3.5" />
+                            ปฏิเสธ
+                          </button>
+                        </div>
+                      </div>
+                      {isAbnormal && (
+                        <div className="mb-3">
+                          <span className="bg-red-100 text-red-700 text-xs font-semibold px-2 py-1 rounded-full inline-flex items-center gap-1">
+                            <AlertCircle className="w-3 h-3" />
+                            ผิดปกติ: {issues.join(', ')}
+                          </span>
+                        </div>
+                      )}
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+                        <VitalBox label="BP" value={record.vitals.bpSystolic && record.vitals.bpDiastolic ? `${record.vitals.bpSystolic}/${record.vitals.bpDiastolic}` : '-'} unit="mmHg" />
+                        <VitalBox label="HR" value={record.vitals.hr || '-'} unit="bpm" />
+                        <VitalBox label="Temp" value={record.vitals.temp || '-'} unit="°C" />
+                        <VitalBox label="RR" value={record.vitals.rr || '-'} unit="/min" />
+                        <VitalBox label="SpO₂" value={record.vitals.spo2 || '-'} unit="%" />
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+
+          {/* ── Section B: บันทึกแล้ว (HOSxP วันนี้) — header เฉพาะตอน central enabled ── */}
+          {!loadingRecords && centralEnabled && (
+            <div className="flex items-center gap-2 pt-4">
+              <ClipboardList className="w-5 h-5 text-emerald-600" />
+              <h2 className="text-lg font-bold text-slate-800">
+                บันทึกแล้ว (HOSxP วันนี้) — <span className="text-emerald-600">{filteredRecords.length}</span>
+              </h2>
+            </div>
+          )}
+
+          {!loadingRecords && filteredRecords.length === 0 && (
+            <div className="text-center py-12 bg-white rounded-xl shadow-sm">
+              <ClipboardList className="w-12 h-12 mx-auto text-slate-300 mb-3" />
+              <p className="text-slate-500">
+                {records.length === 0 ? 'ยังไม่มีข้อมูลใน opdscreen วันนี้' : 'ไม่พบรายการที่ตรงกับตัวกรอง'}
               </p>
             </div>
-          ) : nurseViewMode === 'list' ? (
+          )}
+
+          {!loadingRecords && filteredRecords.length > 0 && nurseViewMode === 'list' && (
             // ── List view ──
             <div className="bg-white rounded-xl shadow-sm overflow-x-auto">
               <div className="min-w-[860px]">
@@ -424,7 +653,9 @@ function VitalSignsAppInner() {
                 })}
               </div>
             </div>
-          ) : (
+          )}
+
+          {!loadingRecords && filteredRecords.length > 0 && nurseViewMode !== 'list' && (
             // ── Card view ──
             <div className="space-y-4">
               {filteredRecords.map((record) => {
@@ -534,13 +765,24 @@ function VitalSignsAppInner() {
           </div>
           <div>
             <label className="text-xs text-slate-600 mb-1 block">HN / รหัสคนไข้ <span className="text-red-500">*</span></label>
-            <input
-              type="text"
-              value={patientId}
-              onChange={(e) => setPatientId(e.target.value)}
-              placeholder="เช่น HN12345"
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500"
-            />
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={patientId}
+                onChange={(e) => setPatientId(e.target.value)}
+                placeholder="เช่น HN12345"
+                className="flex-1 px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+              <button
+                type="button"
+                onClick={() => setScannerOpen(true)}
+                title="สแกน barcode / QR"
+                className="flex items-center gap-1 bg-teal-600 hover:bg-teal-700 text-white px-3 py-2 rounded-lg shadow transition"
+              >
+                <ScanBarcode className="w-4 h-4" />
+                <span className="text-sm hidden sm:inline">สแกน</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -791,6 +1033,15 @@ function VitalSignsAppInner() {
           ส่งให้พยาบาล
         </button>
       </div>
+
+      <BarcodeScanner
+        open={scannerOpen}
+        onResult={(text) => {
+          setPatientId(String(text || '').trim());
+          setScannerOpen(false);
+        }}
+        onClose={() => setScannerOpen(false)}
+      />
     </div>
   );
 }

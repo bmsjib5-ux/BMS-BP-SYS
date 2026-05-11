@@ -7,12 +7,15 @@ import react from '@vitejs/plugin-react';
 // The API key stays in .env on the dev machine; it is never bundled into the
 // client. Production deployments need their own backend proxy — this dev-only
 // pattern is documented at .env.example.
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const anthropicKey = env.ANTHROPIC_API_KEY || '';
   const anthropicVersion = env.ANTHROPIC_VERSION || '2023-06-01';
+  // Production builds (GitHub Pages) live at /BMS-BP-SYS/. Dev server stays at /.
+  const base = command === 'build' ? '/BMS-BP-SYS/' : '/';
 
   return {
+    base,
     plugins: [react()],
     server: {
       port: 5173,
